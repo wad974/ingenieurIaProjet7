@@ -29,9 +29,10 @@ for event in data["results"]:
         )
         
 # embedding
-from embedding import embed_ollama
+from embedding import embed_ollama, chunks_langchain
 
-embed = embed_ollama(data['results'])
+chunks_data = chunks_langchain(data['results'])
+embed = embed_ollama(chunks_data)
 
 print('-' * 50)
 print('contenu apres embedding')
