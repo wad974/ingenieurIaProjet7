@@ -18,22 +18,29 @@ data = response.json()
 
 print("Nombre de résultats :", data["total_count"])
 
+documents = []
 for event in data["results"]:
     # filtre si none
     if event.get("title_fr") is not None:
+        documents.append(event)
         print('*'*50)
-        print(
-            event.get("title_fr"),
-            event.get("firstdate_begin"),
-            event.get("description_fr")
-        )
+        print(event)
         
 # embedding
 from embedding import embed_ollama, chunks_langchain
+import numpy as np
+import faiss
 
+# generation des embeddings apres chunks sur chaque document
 chunks_data = chunks_langchain(data['results'])
-embed = embed_ollama(chunks_data)
+embed = np.array([embed_ollama(chunks_data)])
 
-print('-' * 50)
-print('contenu apres embedding')
-print(embed)
+#Initialisation de l'index faiss
+dimension = embed.shape[1]
+index = faiss.IndexFlatL2(dimension)
+
+#ajout embedding dans index
+index.add(embed)
+
+#sauvegarde index sur le disque bdd/ 
+faiss.write_index(index, "bdd/faiss_index.idx")
