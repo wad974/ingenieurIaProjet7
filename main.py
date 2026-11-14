@@ -32,15 +32,29 @@ import numpy as np
 import faiss
 
 # generation des embeddings apres chunks sur chaque document
-chunks_data = chunks_langchain(data['results'])
-embed = np.array([embed_ollama(chunks_data)])
+
+tous_les_embeddings = []
+for row in documents:
+    
+    chunks_data = chunks_langchain([row])
+    embedding = embed_ollama(chunks_data)
+    
+    tous_les_embeddings.append(embedding)
+
+# conversion numpy
+embedding_for_faiss = np.array(tous_les_embeddings, dtype='float32')
 
 #Initialisation de l'index faiss
-dimension = embed.shape[1]
+dimension = embedding_for_faiss.shape[1]
 index = faiss.IndexFlatL2(dimension)
 
 #ajout embedding dans index
-index.add(embed)
+index.add(embedding_for_faiss)
 
 #sauvegarde index sur le disque bdd/ 
 faiss.write_index(index, "bdd/faiss_index.idx")
+
+# verification que tous les evenements sont indexés
+print("Nombre total d'événements :", len(documents))#31
+print("Nombre de vecteurs :", len(embedding_for_faiss) ,' - ', dimension) # 31 - 768
+print("Nombre de vecteurs dans FAISS :", index.ntotal) # 31
