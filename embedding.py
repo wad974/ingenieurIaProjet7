@@ -1,46 +1,44 @@
 import ollama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import json
+import numpy as np
+import faiss
 
-def chunks_langchain(files):
+
+def chunks_text(texte, chunk_size=800, chunk_overlap=100):
     print('# DEBUT CHUNKS')
     
-    # convert json text
-    text = json.dumps(files, ensure_ascii=False, indent=2)
-    # Initialisation du splitter
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000, # Taille de chaque segment
-        chunk_overlap=200 # Chevauchement entre les segments
+        chunk_size=chunk_size, # Taille de chaque segment
+        chunk_overlap=chunk_overlap # Chevauchement entre les segments
         )
         
     # Découpage du texte
-    chunks = text_splitter.split_text(text)
+    chunks = text_splitter.split_text(texte)
 
-    print('# FIN CHUNKS')
+    print('# FIN CHUNK')
     return chunks
 
 # embbeding function
 
-def embed_ollama(documents) :
+def embed_ollama(texts, batch_size=32) :
     print('# DEBUT EMBEDDING')
+    vecteurs = [] # dict
 
+    # boucle
     # Initialisation du modèle local
-    model = "embeddinggemma-2:latest "
+    model = "embeddinggemma-2:latest"
 
-    # Texte à vectoriser
-    text = documents
-
-    # Obtention de l'embedding
-    response = ollama.embed(
-        model=model,
-        input=text
-    )
-
-    embedding = response["embeddings"][0]
-
-    print("Embedding :")
-    print(embedding)
-
-    print("\nDimension :", len(embedding))
+    for debut in range(0, len(texts), batch_size):
+        lot = texts[debut:debut + batch_size]
+        # Obtention de l'embedding
+        response = ollama.embed(
+            model=model,
+            input=lot
+        )
+        
+        #print('# RESPONSE : ', response)
+        vecteurs.extend(response["embeddings"])
     
-    return embedding
+    return vecteurs
+
