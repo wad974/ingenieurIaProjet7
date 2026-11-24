@@ -1,4 +1,9 @@
-"""Génération de réponses RAG avec Ollama (LLM local uniquement)."""
+"""Génération de réponses RAG ou directes avec Ollama.
+
+Deux modes, comme dans le cours OpenClassrooms :
+- ``RAG`` : la réponse s'appuie uniquement sur les chunks FAISS retrouvés ;
+- ``DIRECT`` : le LLM répond avec ses connaissances générales, sans retrieval.
+"""
 
 from __future__ import annotations
 
@@ -11,10 +16,11 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
 
 from . import config, document_store
+from .query_classifier import Classification, classifier_demande
 
 logger = logging.getLogger(__name__)
 
-PROMPT = ChatPromptTemplate.from_template(
+PROMPT_RAG = ChatPromptTemplate.from_template(
     """
 Tu es un assistant documentaire. Tu réponds uniquement à partir des extraits
 fournis ci-dessous.
@@ -32,12 +38,26 @@ Consignes :
 """
 )
 
+PROMPT_DIRECT = ChatPromptTemplate.from_template(
+    """
+Tu es un assistant culturel de La Réunion.
+Réponds à la question en utilisant tes connaissances générales, en français,
+de façon concise et utile.
+Si tu ne connais pas une information spécifique, dis-le clairement.
+N'invente aucune information.
+
+Question : {question}
+"""
+)
+
 NON_TROUVE = (
-    "Je ne trouve pas cette information dans les documents indexés."
+    "Je n'ai trouvé aucun document pertinent dans la base de connaissances "
+    "pour répondre à cette question."
 )
 
 _llm: ChatOllama | None = None
-_chaine: Any = None
+_chaine_rag: Any = None
+_chaine_directe: Any = None
 _lock = threading.Lock()
 
 
@@ -58,44 +78,90 @@ def obtenir_llm() -> ChatOllama:
     return _llm
 
 
-def obtenir_chaine():
-    """Construit (une seule fois) la chaîne prompt -> LLM -> texte."""
-    global _chaine
-    if _chaine is None:
+def obtenir_chaine_rag():
+    """Construit (une seule fois) la chaîne RAG."""
+    global _chaine_rag
+    if _chaine_rag is None:
         llm = obtenir_llm()  # hors du verrou : éviter un deadlock non réentrant
         with _lock:
-            if _chaine is None:
-                _chaine = PROMPT | llm | StrOutputParser()
-    return _chaine
+            if _chaine_rag is None:
+                _chaine_rag = PROMPT_RAG | llm | StrOutputParser()
+    return _chaine_rag
 
 
-def generer_reponse(question: str, contextes: list[str]) -> str:
-    """Génère une réponse à partir des chunks fournis (sans appel si vide)."""
-    contextes = [contexte for contexte in contextes if contexte.strip()]
+def obtenir_chaine_directe():
+    """Construit (une seule fois) la chaîne de réponse directe."""
+    global _chaine_directe
+    if _chaine_directe is None:
+        llm = obtenir_llm()
+        with _lock:
+            if _chaine_directe is None:
+                _chaine_directe = PROMPT_DIRECT | llm | StrOutputParser()
+    return _chaine_directe
+
+
+def generer_reponse(
+    question: str,
+    contextes: list[str],
+    mode: str = "RAG",
+) -> str:
+    """Génère une réponse en mode RAG ou DIRECT."""
+    mode = mode.upper()
+
+    if mode == "DIRECT":
+        logger.info("Génération DIRECTE (sans RAG) pour %r", question)
+        return obtenir_chaine_directe().invoke({"question": question}).strip()
+
+    contextes = [
+        contexte for contexte in contextes if contexte.strip()
+    ]
     if not contextes:
         return NON_TROUVE
 
     context = "\n\n---\n\n".join(contextes)
-    logger.info("Appel LLM %s pour %r", config.OLLAMA_MODEL, question)
-    reponse = obtenir_chaine().invoke(
+    logger.info("Génération RAG avec %d contexte(s) pour %r", len(contextes), question)
+    return obtenir_chaine_rag().invoke(
         {"context": context, "question": question}
-    )
-    return reponse.strip()
+    ).strip()
 
 
 def repondre(
     question: str,
     top_k: int | None = None,
     score_min: float | None = None,
+    mode: str = "auto",
 ) -> dict[str, Any]:
-    """Retrieval + génération en un seul appel (utilisé par les tests et l'API)."""
-    contextes = document_store.rechercher_documents(
-        question,
-        k=top_k,
-        score_min=score_min,
-    )
+    """Classifie la question, récupère si besoin, puis génère la réponse."""
+    mode = mode.lower()
+
+    if mode == "rag":
+        classification = Classification(True, 1.0, "Mode RAG forcé")
+    elif mode == "direct":
+        classification = Classification(False, 1.0, "Mode DIRECT forcé")
+    elif mode == "auto":
+        classification = classifier_demande(question)
+    else:
+        raise ValueError("mode doit valoir 'auto', 'rag' ou 'direct'")
+
+    contextes: list[dict[str, Any]] = []
+    if classification.needs_rag:
+        contextes = document_store.rechercher_documents(
+            question,
+            k=top_k,
+            score_min=score_min,
+        )
+
     reponse = generer_reponse(
         question,
         [contexte["chunk"] for contexte in contextes],
+        mode=classification.mode,
     )
-    return {"answer": reponse, "contexts": contextes}
+
+    return {
+        "answer": reponse,
+        "contexts": contextes,
+        "mode": classification.mode,
+        "rag_used": classification.needs_rag,
+        "confidence": classification.confidence,
+        "reason": classification.reason,
+    }

@@ -1,12 +1,11 @@
 # API RAG — Ollama + FAISS
 
-API FastAPI à **3 flux** (prompt et réponse fusionnés) pour un assistant documentaire RAG :
+API FastAPI à **2 flux** pour un assistant documentaire RAG :
 
 | Flux | Endpoint | Rôle |
 |------|----------|------|
-| 1. Prompt + Réponse | `POST /prompt` | Reçoit la question (`BaseModel`), cherche dans FAISS, génère la réponse Ollama et renvoie **immédiatement** le JSON complet |
+| 1. Prompt + Réponse + Métriques | `POST /prompt` | Classe la question **RAG ou DIRECT**, cherche dans FAISS si nécessaire, génère la réponse Ollama et renvoie **la réponse avec ses métriques** (retrieval, génération, RAGAS) |
 | 2. Ingestion | `POST /ingest` | Fichiers et/ou URLs → **Markdown** → chunks → embeddings → index FAISS sauvegardé |
-| 3. Métriques | `POST /metrics` | Évalue hit@k, precision@k, recall@k, MRR, F1, exact match et groundedness |
 
 - LLM et embeddings : **Ollama uniquement** (`qwen3.5:2b` + `embeddinggemma-2`).
 - Recherche vectorielle : **FAISS uniquement** (`IndexFlatIP` + normalisation L2, similarité cosinus).
@@ -20,17 +19,18 @@ Projet7/
 │   ├── main.py                 # Application FastAPI, CORS, /health
 │   ├── schemas.py              # Modèles Pydantic (BaseModel) d'entrée/sortie
 │   ├── routers/
-│   │   ├── prompt.py           # Flux 1 : POST /prompt (question -> réponse)
-│   │   ├── ingestion.py        # Flux 2 : POST /ingest
-│   │   └── metrics.py          # Flux 3 : POST /metrics + GET /metrics
+│   │   ├── prompt.py           # Flux 1 : POST /prompt (réponse + métriques)
+│   │   └── ingestion.py        # Flux 2 : POST /ingest
 │   └── services/
-│       └── evaluation.py       # Calcul des métriques
+│       ├── evaluation.py       # Métriques intégrées à la réponse /prompt
+│       └── ragas_evaluation.py # Les 4 métriques RAGAS
 ├── utils/
 │   ├── config.py               # Configuration (.env), chemins, modèles
 │   ├── markdown_converter.py   # PDF/DOCX/TXT/MD/HTML/URL -> Markdown
 │   ├── document_store.py       # Index FAISS des documents (recherche, ajout)
 │   ├── document_ingestion.py   # Orchestration Markdown -> chunks -> index
-│   ├── rag.py                  # Prompt + LLM Ollama (génération)
+│   ├── query_classifier.py     # Routage RAG vs DIRECT
+│   ├── rag.py                  # Prompts RAG/DIRECT + génération Ollama
 │   ├── vector_store.py         # Embeddings Ollama, découpage, index événements
 │   ├── data_loader.py          # Chargement des événements OpenAgenda
 │   ├── database.py             # Feedback utilisateurs (héritage, non utilisé)
@@ -76,15 +76,26 @@ Le corps de la requête est un `BaseModel` `PromptRequest` avec un champ
 ```bash
 curl -X POST http://localhost:8000/prompt \
   -H "Content-Type: application/json" \
-  -d '{"question": "Quel concert de jazz à Saint-Denis ?", "top_k": 4, "score_min": 0.70}'
+  -d '{
+    "question": "Quel concert de jazz à Saint-Denis ?",
+    "mode": "auto",
+    "ground_truth": "Un concert de jazz le 12 juillet 2026 à Saint-Denis.",
+    "expected_sources": ["programme.pdf"],
+    "include_metrics": true,
+    "include_ragas": true
+  }'
 ```
 
-Réponse JSON immédiate (`PromptResponse`) :
+Réponse JSON complète (`PromptResponse`) :
 
 ```json
 {
   "question": "Quel concert de jazz à Saint-Denis ?",
   "answer": "Le concert de jazz aura lieu le 12 juillet 2026 à Saint-Denis, au parc de la Source.",
+  "mode": "RAG",
+  "rag_used": true,
+  "confidence": 0.9,
+  "reason": "Mots-clés liés aux événements/documents : concert, saint-denis",
   "contexts": [
     {
       "chunk": "Le 12 juillet 2026, un concert de jazz…",
@@ -93,12 +104,82 @@ Réponse JSON immédiate (`PromptResponse`) :
     }
   ],
   "model": "qwen3.5:2b",
-  "elapsed_ms": 4612.3
+  "elapsed_ms": 71433.7,
+  "metrics": {
+    "hit@k": 1.0,
+    "precision@k": 1.0,
+    "recall@k": 1.0,
+    "mrr": 1.0,
+    "groundedness": 0.5278,
+    "f1": 0.3951,
+    "exact_match": 0.0,
+    "faithfulness": 0.75,
+    "answer_relevancy": 0.7901,
+    "context_precision": 1.0,
+    "context_recall": 1.0
+  },
+  "ragas_error": null,
+  "metrics_elapsed_ms": 66821.4
 }
 ```
 
-La recherche FAISS et la génération Ollama sont exécutées dans la même
-requête : un seul appel suffit pour obtenir la réponse.
+#### Mode RAG ou DIRECT
+
+Comme dans le cours OpenClassrooms, un classificateur décide si la question
+nécessite le RAG :
+
+- **RAG** : question sur les événements, dates, lieux, programmes ou documents
+  indexés. Détection par mots-clés, puis LLM local pour les cas ambigus.
+- **DIRECT** : salutation, question générale, météo, question sur les capacités
+  de l'assistant, etc.
+
+> Le classificateur n'appelle le LLM local que pour les questions ambiguës ;
+> les salutations et les mots-clés métier sont traités instantanément.
+
+Le champ `mode` permet de forcer le comportement :
+
+```bash
+# Forcer le RAG
+curl -X POST http://localhost:8000/prompt \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Quel concert à Saint-Denis ?", "mode": "rag"}'
+
+# Forcer le LLM seul, sans consultation de l'index
+curl -X POST http://localhost:8000/prompt \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Quel concert à Saint-Denis ?", "mode": "direct"}'
+```
+
+En mode `DIRECT`, `contexts` est vide et `rag_used` vaut `false`. En mode
+`RAG`, si aucun chunk n'est trouvé, la réponse l'indique explicitement.
+
+> Le mode `DIRECT` utilise les connaissances générales du modèle : il peut
+> inventer des informations locales. C'est précisément ce que le RAG évite.
+
+#### Métriques intégrées à la réponse
+
+`include_metrics=true` (défaut) ajoute un objet `metrics` à la réponse :
+
+- **Retrieval** : `hit@k`, `precision@k`, `recall@k`, `mrr`, calculés si
+  `expected_sources` ou `expected_snippets` sont fournis.
+- **Génération** : `groundedness` (dès qu'il y a des contextes), `f1` et
+  `exact_match` si `ground_truth` est fourni.
+- **RAGAS** (`include_ragas=true`, défaut) :
+  - mode `DIRECT` : `answer_relevancy` ;
+  - mode `RAG` : `faithfulness` + `answer_relevancy` ;
+  - mode `RAG` avec `ground_truth` : ajoute `context_precision` et
+    `context_recall`.
+
+Notes :
+
+- `ground_truth` est nécessaire pour `context_precision`, `context_recall`,
+  `f1` et `exact_match`.
+- RAGAS appelle Ollama plusieurs fois : comptez environ **1 minute** par
+  prompt. `metrics_elapsed_ms` indique le temps passé dans les métriques.
+- Mettre `"include_metrics": false` (ou `"include_ragas": false`) pour une
+  réponse plus rapide.
+- En cas d'échec RAGAS, la réponse reste disponible et `ragas_error` contient
+  le détail.
 
 ### Flux 2 — injecter des fichiers et/ou des URLs
 
@@ -139,39 +220,6 @@ Réponse (extrait) :
 }
 ```
 
-### Flux 3 — tester les métriques
-
-```bash
-# État de l'index
-curl http://localhost:8000/metrics
-
-# Évaluation
-curl -X POST http://localhost:8000/metrics \
-  -H "Content-Type: application/json" \
-  -d '{
-    "cases": [
-      {
-        "question": "Quel concert à Saint-Denis ?",
-        "expected_sources": ["programme.pdf"],
-        "expected_snippets": ["concert de jazz"]
-      }
-    ],
-    "top_k": 4,
-    "score_min": 0.70,
-    "include_generation": true,
-    "expected_answer": "Un concert de jazz le 12 juillet 2026."
-  }'
-```
-
-Métriques calculées :
-
-- **Retrieval** : `hit@k`, `precision@k`, `recall@k`, `mrr` — à partir de
-  `expected_sources` (titre/id/source du document) ou `expected_snippets`
-  (texte présent dans le chunk).
-- **Génération** (`include_generation=true`) : `groundedness` (part des mots
-  de la réponse présents dans les contextes) et, si `expected_answer` est
-  fourni, `f1` et `exact_match`.
-
 ### Santé
 
 ```bash
@@ -179,19 +227,34 @@ curl http://localhost:8000/health
 curl http://localhost:8000/
 ```
 
+## Adaptation du cours OpenClassrooms
+
+- `utils/query_classifier.py` reprend le `QueryClassifier` du dépôt du cours
+  (heuristiques + classification LLM) pour router **RAG vs DIRECT**.
+- `api/services/ragas_evaluation.py` reprend le notebook `P2C4_RAGASS.ipynb`
+  avec `faithfulness`, `answer_relevancy`, `context_precision` et
+  `context_recall`.
+- Les modèles Mistral du cours sont remplacés par **Ollama**
+  (`ChatOllama` + `OllamaEmbeddings`), tout en conservant l'architecture API
+  du projet.
+- Les métriques RAGAS sont intégrées à la réponse de `POST /prompt` ; il n'y a
+  plus de flux `/metrics` séparé.
+
 ## Tests
 
 ```bash
 python -m pytest test -v
 ```
 
-Les tests API remplacent les embeddings Ollama par des vecteurs déterministes :
-ils ne nécessitent ni Ollama ni réseau.
+Les tests API remplacent les embeddings Ollama par des vecteurs déterministes
+et mockent RAGAS : ils ne nécessitent ni Ollama ni réseau.
 
 ## Notes
 
 - L'interface est **uniquement l'API FastAPI** ; l'ancien code Streamlit a été
   supprimé.
+- Le flux `/metrics` séparé a été supprimé : les métriques sont directement
+  renvoyées par `POST /prompt`.
 - L'index RAG de l'API (`bdd/rag_index.faiss`) est **distinct** de l'index des
   événements (`bdd/faiss_index.idx`, construit par `indexer.py`).
 - `documents/`, `bdd/rag_index.faiss` et `bdd/rag_metadata.pkl` sont générés et

@@ -1,4 +1,9 @@
-"""Évaluation du retrieval et de la génération (flux 3)."""
+"""Métriques d'une réponse : retrieval, génération et RAGAS.
+
+Ce module est appelé directement par le flux ``/prompt`` : les métriques sont
+renvoyées dans la même réponse JSON que la réponse du LLM. Il n'y a plus
+d'endpoint ``/metrics`` séparé.
+"""
 
 from __future__ import annotations
 
@@ -6,10 +11,6 @@ import logging
 import re
 from collections import Counter
 from typing import Any
-
-from api.schemas import EvalCase, MetricsOut, MetricsRequest
-from utils import document_store
-from utils.rag import generer_reponse
 
 logger = logging.getLogger(__name__)
 
@@ -54,22 +55,29 @@ def _document_correspond(
 
 def _evaluer_retrieval(
     retrieved: list[dict[str, Any]],
-    case: EvalCase,
+    attendus: list[str],
+    snippets: list[str],
 ) -> dict[str, float] | None:
     """Calcule hit@k, precision@k, recall@k et MRR si un attendu est fourni."""
-    attendus = [attendu for attendu in case.expected_sources if attendu]
-    snippets = [snippet for snippet in case.expected_snippets if snippet]
+    attendus = [attendu for attendu in attendus if attendu]
+    snippets = [snippet for snippet in snippets if snippet]
 
     if attendus:
         documents = [resultat["document"] for resultat in retrieved]
         pertinents = [
-            any(_document_correspond(document, [attendu]) for attendu in attendus)
+            any(
+                _document_correspond(document, [attendu])
+                for attendu in attendus
+            )
             for document in documents
         ]
         trouves = {
             attendu
             for attendu in attendus
-            if any(_document_correspond(document, [attendu]) for document in documents)
+            if any(
+                _document_correspond(document, [attendu])
+                for document in documents
+            )
         }
         nb_attendus = len(attendus)
     elif snippets:
@@ -118,102 +126,79 @@ def _groundedness(reponse: str, contextes: list[str]) -> float:
     return sum(1 for mot in mots if mot in vocabulaire) / len(mots)
 
 
-def _moyenne(valeurs: list[float]) -> float | None:
-    if not valeurs:
-        return None
-    return round(sum(valeurs) / len(valeurs), 4)
+def evaluer_reponse(
+    question: str,
+    answer: str,
+    mode: str,
+    contexts: list[dict[str, Any]],
+    ground_truth: str | None = None,
+    expected_sources: list[str] | None = None,
+    expected_snippets: list[str] | None = None,
+    include_ragas: bool = True,
+) -> dict[str, Any]:
+    """Calcule les métriques d'une réponse et les renvoie avec la réponse."""
+    chunks = [contexte["chunk"] for contexte in contexts]
+    metriques: dict[str, Any] = {}
 
-
-def evaluer(payload: MetricsRequest) -> MetricsOut:
-    """Évalue chaque cas puis agrège les métriques."""
-    index_stats = document_store.statistiques_index()
-    resultats: list[dict[str, Any]] = []
-    metriques_retrieval: list[dict[str, float]] = []
-    scores_f1: list[float] = []
-    scores_em: list[float] = []
-    scores_groundedness: list[float] = []
-
-    for case in payload.cases:
-        retrieved = document_store.rechercher_documents(
-            case.question,
-            k=payload.top_k,
-            score_min=payload.score_min,
+    # --- Métriques de retrieval --------------------------------------------
+    retrieval = _evaluer_retrieval(
+        contexts,
+        expected_sources or [],
+        expected_snippets or [],
+    )
+    if retrieval is not None:
+        metriques.update(
+            {cle: round(valeur, 4) for cle, valeur in retrieval.items()}
         )
-        chunks = [resultat["chunk"] for resultat in retrieved]
 
-        metriques_cas: dict[str, Any] = {}
+    # --- Métriques de génération -------------------------------------------
+    if chunks:
+        metriques["groundedness"] = round(
+            _groundedness(answer, chunks),
+            4,
+        )
 
-        retrieval = _evaluer_retrieval(retrieved, case)
-        if retrieval is not None:
-            metriques_retrieval.append(retrieval)
-            metriques_cas.update(
-                {cle: round(valeur, 4) for cle, valeur in retrieval.items()}
-            )
+    if ground_truth:
+        f1 = _f1(answer, ground_truth)
+        metriques["f1"] = round(f1, 4)
+        metriques["exact_match"] = (
+            1.0
+            if _normaliser(answer) == _normaliser(ground_truth)
+            else 0.0
+        )
 
-        reponse: str | None = None
-        if payload.include_generation:
-            reponse = generer_reponse(case.question, chunks)
-            metriques_cas["groundedness"] = round(
-                _groundedness(reponse, chunks),
-                4,
-            )
-            scores_groundedness.append(metriques_cas["groundedness"])
+    # --- Métriques RAGAS ----------------------------------------------------
+    ragas_error: str | None = None
+    if include_ragas:
+        if not answer.strip():
+            ragas_error = "Réponse vide : RAGAS ignoré."
+        else:
+            noms: list[str] = []
+            if mode == "RAG" and chunks:
+                noms.append("faithfulness")
+            noms.append("answer_relevancy")
+            if ground_truth and chunks:
+                noms.extend(["context_precision", "context_recall"])
 
-            if case.expected_answer:
-                f1 = _f1(reponse, case.expected_answer)
-                em = (
-                    1.0
-                    if _normaliser(reponse) == _normaliser(case.expected_answer)
-                    else 0.0
+            try:
+                from api.services.ragas_evaluation import (
+                    evaluer_avec_ragas,
                 )
-                scores_f1.append(f1)
-                scores_em.append(em)
-                metriques_cas["f1"] = round(f1, 4)
-                metriques_cas["exact_match"] = em
-        elif case.expected_answer:
-            metriques_cas["f1"] = None
-            metriques_cas["exact_match"] = None
-            metriques_cas["note"] = (
-                "include_generation=true requis pour les métriques de réponse."
-            )
 
-        resultats.append(
-            {
-                "question": case.question,
-                "retrieved": [
-                    {
-                        "score": round(resultat["score"], 4),
-                        "title": resultat["document"].get("title"),
-                        "source": resultat["document"].get("source"),
-                    }
-                    for resultat in retrieved
-                ],
-                "metrics": metriques_cas,
-                "answer": reponse,
-            }
-        )
+                resultat = evaluer_avec_ragas(
+                    [
+                        {
+                            "question": question,
+                            "answer": answer,
+                            "contexts": chunks,
+                            "ground_truth": ground_truth or "",
+                        }
+                    ],
+                    metriques=noms,
+                )
+                metriques.update(resultat["scores"])
+            except Exception as exc:
+                logger.exception("Échec de l'évaluation RAGAS")
+                ragas_error = f"RAGAS a échoué : {exc}"
 
-    aggregate: dict[str, Any] = {
-        "hit@k": _moyenne([m["hit@k"] for m in metriques_retrieval]),
-        "precision@k": _moyenne([m["precision@k"] for m in metriques_retrieval]),
-        "recall@k": _moyenne([m["recall@k"] for m in metriques_retrieval]),
-        "mrr": _moyenne([m["mrr"] for m in metriques_retrieval]),
-        "f1": _moyenne(scores_f1),
-        "exact_match": _moyenne(scores_em),
-        "groundedness": _moyenne(scores_groundedness),
-        "n_cases": len(payload.cases),
-        "n_retrieval_evalues": len(metriques_retrieval),
-        "n_generation_evalues": len(scores_groundedness),
-    }
-
-    logger.info(
-        "Évaluation terminée : %d cas, %d avec métriques de retrieval",
-        len(payload.cases),
-        len(metriques_retrieval),
-    )
-    return MetricsOut(
-        n_cases=len(payload.cases),
-        index=index_stats,
-        aggregate=aggregate,
-        results=resultats,
-    )
+    return {"metrics": metriques, "ragas_error": ragas_error}

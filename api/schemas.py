@@ -48,6 +48,44 @@ class PromptRequest(BaseModel):
     )
     top_k: int = Field(default=4, ge=1, le=20)
     score_min: float = Field(default=0.70, ge=-1.0, le=1.0)
+    mode: Literal["auto", "rag", "direct"] = Field(
+        default="auto",
+        description=(
+            "auto : classificateur RAG/DIRECT ; rag : force le RAG ; "
+            "direct : force la réponse du LLM seul."
+        ),
+    )
+    ground_truth: str | None = Field(
+        default=None,
+        description=(
+            "Réponse de référence. Active context_precision, context_recall "
+            "et les métriques F1/exact_match."
+        ),
+    )
+    expected_sources: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Sources attendues (titre/id/source) pour hit@k, precision@k, "
+            "recall@k et MRR."
+        ),
+    )
+    expected_snippets: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Extraits attendus dans les chunks pour les métriques de retrieval."
+        ),
+    )
+    include_metrics: bool = Field(
+        default=True,
+        description="Calcule et renvoie les métriques avec la réponse.",
+    )
+    include_ragas: bool = Field(
+        default=True,
+        description=(
+            "Calcule les métriques RAGAS (faithfulness, answer_relevancy, "
+            "context_precision, context_recall). Peut être lent."
+        ),
+    )
 
     @field_validator("question")
     @classmethod
@@ -56,13 +94,20 @@ class PromptRequest(BaseModel):
 
 
 class PromptResponse(BaseModel):
-    """Sortie JSON : la réponse est renvoyée immédiatement avec les sources."""
+    """Sortie JSON : réponse immédiate + mode + métriques."""
 
     question: str
     answer: str
+    mode: Literal["RAG", "DIRECT"]
+    rag_used: bool
+    confidence: float
+    reason: str
     contexts: list[ContextOut]
     model: str
     elapsed_ms: float
+    metrics: dict[str, Any] | None = None
+    ragas_error: str | None = None
+    metrics_elapsed_ms: float | None = None
 
 
 # --- Flux 2 : ingestion -----------------------------------------------------
@@ -89,30 +134,3 @@ class IngestionOut(BaseModel):
     replace: bool
     sources: list[SourceResultat]
     index: IndexStats
-
-
-# --- Flux 3 : métriques -----------------------------------------------------
-class EvalCase(BaseModel):
-    question: str = Field(..., min_length=1, max_length=4000)
-    expected_answer: str | None = None
-    expected_sources: list[str] = Field(default_factory=list)
-    expected_snippets: list[str] = Field(default_factory=list)
-
-    @field_validator("question")
-    @classmethod
-    def _question_non_vide(cls, value: str) -> str:
-        return _valider_question(value)  # type: ignore[return-value]
-
-
-class MetricsRequest(BaseModel):
-    cases: list[EvalCase] = Field(default_factory=list)
-    top_k: int = Field(default=4, ge=1, le=20)
-    score_min: float = Field(default=0.70, ge=-1.0, le=1.0)
-    include_generation: bool = False
-
-
-class MetricsOut(BaseModel):
-    n_cases: int
-    index: IndexStats
-    aggregate: dict[str, Any]
-    results: list[dict[str, Any]]

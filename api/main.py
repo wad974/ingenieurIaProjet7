@@ -1,4 +1,4 @@
-"""Application FastAPI — API RAG à 3 flux (Ollama + FAISS).
+"""Application FastAPI — API RAG à 2 flux (Ollama + FAISS).
 
 Lancement :
     uvicorn api.main:app --reload --port 8000
@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routers import ingestion, metrics, prompt
+from api.routers import ingestion, prompt
 from utils import config, document_store
 from utils.logging_config import setup_logging
 
@@ -37,11 +37,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="API RAG — Ollama + FAISS",
     description=(
-        "Trois flux : prompt et réponse fusionnés (une question -> une réponse "
-        "JSON), ingestion de fichiers/URLs (Markdown -> chunks -> embeddings "
-        "-> FAISS) et métriques."
+        "Deux flux : prompt + réponse avec métriques intégrées (routage "
+        "RAG/DIRECT, retrieval, génération et RAGAS : faithfulness, "
+        "answer_relevancy, context_precision, context_recall) et ingestion "
+        "de fichiers/URLs (Markdown -> chunks -> embeddings -> FAISS)."
     ),
-    version="1.1.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -55,7 +56,6 @@ app.add_middleware(
 
 app.include_router(prompt.router)
 app.include_router(ingestion.router)
-app.include_router(metrics.router)
 
 
 @app.get("/", tags=["Santé"])
@@ -64,9 +64,10 @@ def racine() -> dict:
         "name": "API RAG — Ollama + FAISS",
         "docs": "/docs",
         "endpoints": {
-            "flux_1_prompt_reponse": "POST /prompt",
+            "flux_1_prompt_reponse_metriques": (
+                "POST /prompt (mode auto|rag|direct, métriques incluses)"
+            ),
             "flux_2_ingestion": "POST /ingest",
-            "flux_3_metriques": "POST /metrics (GET /metrics pour l'état)",
         },
     }
 
