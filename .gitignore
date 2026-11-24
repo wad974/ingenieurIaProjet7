@@ -1,0 +1,23 @@
+# Environnements virtuels
+env/
+venv/
+.venv/
+
+# Secrets (ne jamais versionner)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Journaux et données générées localement
+logs/
+bdd/feedback.db
+bdd/*.db-journal
+
+# Documents ingérés et index RAG générés par l'API
+documents/
+bdd/rag_index.faiss
+bdd/rag_metadata.pkl
