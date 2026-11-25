@@ -66,6 +66,67 @@ uvicorn api.main:app --reload --port 8000
 > réglage par défaut : avec la réflexion active, le modèle consomme tous ses
 > tokens en interne et renvoie une réponse vide.
 
+## Exécution en conteneur Docker (recommandé pour la démo)
+
+Deux conteneurs sur un réseau interne : **Ollama** (LLM + embeddings, modèles
+mis en cache dans un volume Docker) et **l'API FastAPI**. Le port hôte est
+configurable via `API_PORT` (8000 par défaut).
+
+```bash
+docker compose up --build -d       # build + démarrage complet
+curl http://localhost:8000/health  # vérification
+docker compose logs -f api         # suivre les journaux
+```
+
+Le premier démarrage télécharge les modèles (`OLLAMA_MODEL` +
+`embeddinggemma-2`) dans le volume `ollama_models` — comptez quelques
+minutes. Ensuite, la stack démarre en secondes et **fonctionne hors-ligne** :
+seul le port de l'API est exposé. L'index FAISS et les documents ingérés sont
+montés depuis `./bdd` et `./documents` : l'état créé côté hôte persiste.
+
+Si le port 8000 est déjà occupé (par exemple par un uvicorn local) :
+
+```bash
+API_PORT=8001 docker compose up --build -d   # autre port hôte
+```
+
+### Construire l'index vectoriel
+
+Construit `bdd/faiss_index.idx` (index des événements OpenAgenda) à
+l'intérieur du conteneur API ; la connexion Internet n'est nécessaire que
+pour charger les événements et, au premier lancement, les modèles :
+
+```bash
+docker compose up -d
+./scripts/build_index.sh          # 500 événements (valeur de .env)
+./scripts/build_index.sh 200      # nombre d'événements personnalisé
+```
+
+> L'index RAG de l'API (`bdd/rag_index.faiss`) se construit différemment :
+> via `POST /ingest`, ou simplement avec le script de démo ci-dessous.
+
+### Démo bout-en-bout
+
+Script complet : santé → ingestion du corpus → questions de démonstration
+(scénarios RAG et DIRECT). `--quick` désactive les métriques pour des
+réponses immédiates :
+
+```bash
+docker compose up -d --wait
+./scripts/demo.sh --quick         # démo live fluide
+./scripts/demo.sh                 # avec métriques et RAGAS
+```
+
+Swagger UI pour la présentation et les tests d'endpoints :
+`http://localhost:8000/docs`.
+
+### Variante GPU (facultatif)
+
+Le compose tourne par défaut sur CPU. Avec le NVIDIA Container Toolkit
+installé (`nvidia-container-toolkit`), décommentez le bloc `deploy` du service
+`ollama` dans `docker-compose.yml` et relancez : l'inférence utilisera le GPU
+et les réponses seront bien plus rapides.
+
 ## Utilisation
 
 ### Flux 1 — poser une question et obtenir la réponse JSON
